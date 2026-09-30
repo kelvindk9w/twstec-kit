@@ -9,15 +9,20 @@ use RuntimeException;
 use stdClass;
 use Throwable;
 use Twstec\Kit\Setup\Contracts\Runner;
+use Twstec\Kit\Setup\Dev\DevEnvironment;
+use Twstec\Kit\Setup\Dev\Host;
+use Twstec\Kit\Setup\Platform\PlatformRequirements;
 
 /**
  * `composer create-project twstec/kit meu-projeto` — o que acontece depois
  * que o Composer baixou este pacote na pasta do projeto (o
  * post-create-project-cmd dele):
  *
- * 1. A ESCOLHA: pelo menu (terminal) ou pelo ambiente (TWS_KIT_STACK,
- *    TWS_KIT_WITH, TWS_KIT_WITHOUT; sem nada, o padrão: Livewire com todos os
- *    módulos). Escolha inválida para aqui, antes de baixar qualquer coisa.
+ * 1. A ESCOLHA: pelo menu (terminal) ou pelo ambiente (TWS_KIT_NAME,
+ *    TWS_KIT_SLOT, TWS_KIT_EXPOSE_DB, TWS_KIT_STACK, TWS_KIT_WITH,
+ *    TWS_KIT_WITHOUT; sem nada, o padrão: o nome da pasta, o primeiro número
+ *    com as portas livres, Livewire com todos os módulos). Escolha inválida
+ *    para aqui, antes de baixar qualquer coisa.
  * 2. O STARTER escolhido é baixado pelo MESMO Composer
  *    (`create-project --no-install --no-scripts`, com a mesma restrição de
  *    versão deste pacote e os mesmos repositórios do composer.json dele —
@@ -32,7 +37,25 @@ use Twstec\Kit\Setup\Contracts\Runner;
  *    escolha no ambiente — TWS_KIT_WITH/TWS_KIT_WITHOUT —, que não pergunta
  *    de novo: gera a APP_KEY e o pepper e roda as migrations, ou avisa que o
  *    banco ficou para depois).
- * 5. O banco: se o do .env não respondeu, a instrução exata.
+ *    O nome e o número do projeto vão junto (TWS_KIT_NAME, TWS_KIT_SLOT,
+ *    TWS_KIT_EXPOSE_DB): o instalador grava no .env o Docker de
+ *    desenvolvimento do projeto (portas, nome, endereço, senhas).
+ * 5. O banco: com o Docker de desenvolvimento no projeto (compose.yaml), o
+ *    `docker compose up -d` sobe o banco e roda as migrations; sem ele, se o
+ *    do .env não respondeu, a instrução exata.
+ *
+ * EXTENSÕES DO PHP: as chamadas ao Composer recebem o que a pessoa pediu para
+ * ignorar (COMPOSER_IGNORE_PLATFORM_REQ(S) e as opções do create-project,
+ * quando dá para lê-las) e, no Windows, `ext-pcntl` e `ext-posix` (só o
+ * Horizon as usa; o PHP do Windows não as tem) — o resumo avisa. Qualquer
+ * outra extensão que falte para o `composer update` com a lista e as duas
+ * saídas: instalar a extensão, ou o caminho só com o Docker. Ver
+ * Platform/PlatformRequirements.
+ *
+ * DENTRO DO CONTAINER DO INSTALADOR (`docker compose run --rm instalar`,
+ * TWS_KIT_IN_DOCKER=1): o projeto é montado na própria pasta baixada do
+ * twstec/kit, e as mensagens falam dela ("esta pasta") e dos comandos do
+ * Docker, não de `cd` e `composer`.
  *
  * FALHA LIMPA: antes do passo 3, nada do projeto mudou — a pasta temporária
  * sai e a mensagem diz para apagar a pasta e rodar de novo. Depois dele, a
@@ -52,6 +75,20 @@ final class CreateProject
     public const TEMPORARY_PREFIX = '.tws-kit-starter-';
 
     /**
+     * Rodando no container do instalador (a pasta é a do ZIP)?
+     */
+    private readonly bool $inDocker;
+
+    /**
+     * As variáveis de plataforma para TODAS as chamadas ao Composer.
+     *
+     * @var array<string, string>
+     */
+    private readonly array $platform;
+
+    private readonly bool $windows;
+
+    /**
      * @param  array<string, string|false>  $env
      * @param  (Closure(array<string, string>, string): ?Choice)|null  $menu  null = sem perguntas
      */
@@ -61,8 +98,34 @@ final class CreateProject
         private readonly Runner $runner,
         private readonly Output $out,
         private readonly array $env,
+        private readonly Host $host,
         private readonly ?Closure $menu = null,
-    ) {}
+        string $osFamily = PHP_OS_FAMILY,
+        array $callerArguments = [],
+    ) {
+        $this->inDocker = ($env['TWS_KIT_IN_DOCKER'] ?? '') === '1';
+        $this->windows = PlatformRequirements::isWindows($osFamily);
+        $this->platform = PlatformRequirements::composerEnvironment($env, $osFamily, $callerArguments);
+    }
+
+    /**
+     * A pasta do projeto, como a pessoa a vê (a base do nome sugerido): no
+     * container, a que o Compose informa (TWS_KIT_FOLDER); fora, a própria.
+     */
+    public function folder(): string
+    {
+        return self::folderOf($this->directory, $this->env);
+    }
+
+    /**
+     * @param  array<string, string|false>  $env
+     */
+    public static function folderOf(string $directory, array $env): string
+    {
+        $folder = trim((string) ($env['TWS_KIT_FOLDER'] ?? ''));
+
+        return $folder !== '' ? $folder : basename($directory);
+    }
 
     public function run(): int
     {
@@ -80,7 +143,7 @@ final class CreateProject
         $defaultStack = (string) ($config->{'default-starter'} ?? array_key_first($starters));
         $constraint = $config->constraint;
 
-        $this->out->line($this->t->get('intro', ['dir' => $this->directory]));
+        $this->out->line($this->text('intro', ['dir' => $this->directory]));
 
         $choice = $this->choose($starters, $defaultStack);
 
@@ -101,7 +164,7 @@ final class CreateProject
             try {
                 $this->replaceWithStarter($temporary);
             } catch (Throwable $e) {
-                $this->out->error($this->t->get('failures.replace', ['dir' => $this->directory, 'reason' => $e->getMessage()]));
+                $this->out->error($this->text('failures.replace', ['dir' => $this->directory, 'reason' => $e->getMessage()]));
 
                 return 1;
             }
@@ -133,22 +196,24 @@ final class CreateProject
             $choice = ($this->menu)($starters, $defaultStack);
 
             if ($choice === null) {
-                $this->out->warn($this->t->get('aborted', ['dir' => $this->directory]));
+                $this->out->warn($this->text('aborted', ['dir' => $this->directory]));
             }
 
             return $choice;
         }
 
-        [$choice, $error] = Choice::fromEnvironment($this->env, array_keys($starters), $defaultStack, $this->t);
+        [$choice, $error] = Choice::fromEnvironment($this->env, array_keys($starters), $defaultStack, $this->t, $this->host, $this->folder());
 
         if ($choice === null) {
             $this->out->error((string) $error);
-            $this->out->line($this->t->get('errors.nothing_installed', ['dir' => $this->directory]));
+            $this->out->line($this->text('errors.nothing_installed', ['dir' => $this->directory]));
 
             return null;
         }
 
         $this->out->line($this->t->get('plan.from_environment', [
+            'name' => (string) $choice->name,
+            'slot' => (string) $choice->slot,
             'stack' => $this->t->get("stack.{$choice->stack}"),
             'modules' => $choice->modules === [] ? $this->t->get('modules.none') : $this->t->modules($choice->modules),
         ]));
@@ -172,8 +237,8 @@ final class CreateProject
             $arguments[] = '--repository='.json_encode($repository, JSON_UNESCAPED_SLASHES);
         }
 
-        if ($this->runner->composer($arguments, $this->directory) !== 0 || ! is_file($temporary.'/composer.json')) {
-            $this->out->error($this->t->get('failures.download', ['package' => $package, 'dir' => $this->directory]));
+        if ($this->runner->composer($arguments, $this->directory, $this->platform) !== 0 || ! is_file($temporary.'/composer.json')) {
+            $this->out->error($this->text('failures.download', ['package' => $package, 'dir' => $this->directory]));
 
             return null;
         }
@@ -181,7 +246,7 @@ final class CreateProject
         $starter = $this->readJson($temporary.'/composer.json');
 
         if (($starter->name ?? null) !== $package || ($starter->type ?? null) !== 'project') {
-            $this->out->error($this->t->get('failures.unexpected', ['package' => $package, 'dir' => $this->directory]));
+            $this->out->error($this->text('failures.unexpected', ['package' => $package, 'dir' => $this->directory]));
 
             return null;
         }
@@ -267,20 +332,49 @@ final class CreateProject
                 'TWS_KIT_WITHOUT' => implode(',', $choice->without()),
                 // O instalador do projeto fala a língua do menu.
                 'APP_LOCALE' => $this->t->locale,
+                // O resumo final é o deste comando (o aviso do Windows, uma vez).
+                'TWS_KIT_FROM_KIT' => '1',
+                // O Docker de desenvolvimento do projeto: o instalador grava
+                // no .env (e não pergunta de novo).
+                ...$this->devEnvironment($choice),
             ]],
         ];
 
         foreach ($steps as $index => [$label, $arguments, $env]) {
             $this->out->step($this->t->get($label));
 
-            if ($this->runner->composer($arguments, $this->directory, $env) === 0) {
+            // O `composer update` guarda a saída: a mensagem de extensão que
+            // falta é lida dela.
+            $update = $arguments[0] === 'update';
+
+            if ($this->runner->composer($arguments, $this->directory, [...$this->platform, ...$env], $update) === 0) {
                 continue;
             }
 
             $this->out->line();
-            $this->out->error($this->t->get('failures.incomplete', ['dir' => $this->directory, 'step' => $this->t->get($label)]));
-            $this->out->line($this->t->get('failures.finish'));
+            $this->out->error($this->text('failures.incomplete', ['dir' => $this->directory, 'step' => $this->t->get($label)]));
+
+            $missing = $update ? PlatformRequirements::missingExtensions($this->runner->output()) : [];
+
+            if ($missing !== []) {
+                $this->missingExtensions($missing);
+            }
+
+            // No container, a pasta já é um projeto pela metade, sem o
+            // instalador: recomeçar do ZIP é o caminho simples.
+            if ($this->inDocker) {
+                $this->out->line($this->text('failures.restart', ['dir' => $this->directory]));
+
+                return false;
+            }
+
+            $this->out->line($this->t->get($missing === [] ? 'failures.finish' : 'failures.finish_after_extensions'));
             $this->out->command('cd '.$this->directory);
+
+            // O que foi ignorado aqui vale para os comandos de terminar.
+            foreach ($this->platform as $name => $value) {
+                $this->out->command($this->windows ? "\$env:{$name} = \"{$value}\"" : "export {$name}={$value}");
+            }
 
             foreach (array_slice($steps, $index) as [, $remaining]) {
                 $this->out->command('composer '.implode(' ', array_slice($remaining, 0, -1)));
@@ -294,11 +388,37 @@ final class CreateProject
         return true;
     }
 
+    /**
+     * Extensões do PHP que faltam (e não são dispensáveis): a lista e as duas
+     * saídas — instalar, ou o caminho só com o Docker.
+     *
+     * @param  list<string>  $missing
+     */
+    private function missingExtensions(array $missing): void
+    {
+        $this->out->line();
+        $this->out->error($this->t->get('extensions.missing', ['extensions' => implode(', ', $missing)]));
+        $this->out->line($this->t->get('extensions.install'));
+        $this->out->line($this->t->get('extensions.windows', [
+            'lines' => implode(', ', array_map(static fn (string $e): string => "extension={$e}", $missing)),
+        ]));
+        $this->out->line($this->t->get('extensions.linux', [
+            'packages' => implode(' ', array_map(static fn (string $e): string => "php8.4-{$e}", $missing)),
+        ]));
+        $this->out->line($this->t->get('extensions.mac'));
+        $this->out->line($this->t->get('extensions.docker'));
+        $this->out->line();
+    }
+
     private function finish(Choice $choice, string $package): int
     {
         $this->out->line();
 
-        if ($this->runner->quietPhp(['artisan', 'migrate:status', '--pending=1', '--no-interaction'], $this->directory) === 0) {
+        $docker = is_file($this->directory.'/compose.yaml') && $choice->name !== null && $choice->slot !== null;
+
+        if ($docker) {
+            $this->out->info($this->t->get('database.docker'));
+        } elseif ($this->runner->quietPhp(['artisan', 'migrate:status', '--pending=1', '--no-interaction'], $this->directory) === 0) {
             $this->out->info($this->t->get('database.ready'));
         } else {
             $this->out->warn($this->t->get('database.unreachable', [
@@ -310,18 +430,94 @@ final class CreateProject
         }
 
         $this->out->line();
-        $this->out->info($this->t->get('done.heading', ['dir' => $this->directory]));
+        $this->out->info($this->text('done.heading', ['dir' => $this->directory]));
         $this->out->line($this->t->get('done.stack', ['stack' => $this->t->get("stack.{$choice->stack}"), 'package' => $package]));
         $this->out->line($this->t->get('done.modules', [
             'modules' => $this->t->modules([...Modules::REQUIRED, ...$choice->modules]),
         ]));
-        $this->out->line($this->t->get('done.next'));
-        $this->out->command('cd '.$this->directory);
-        $this->out->command('npm install && npm run build');
-        $this->out->command('composer dev');
+
+        if ($docker) {
+            $this->dockerSummary($choice);
+        } else {
+            $this->out->line($this->t->get('done.next'));
+            $this->out->command('cd '.$this->directory);
+            $this->out->command('npm install && npm run build');
+            $this->out->command('composer dev');
+        }
+
+        // Windows: o Horizon não roda nativo (sem pcntl/posix, ignoradas na
+        // instalação) — o resto do aplicativo sim.
+        if ($this->windows && ! $this->inDocker) {
+            $this->out->line();
+            $this->out->warn($this->t->get('extensions.windows_horizon'));
+        }
+
         $this->out->line();
 
         return 0;
+    }
+
+    /**
+     * O Docker de desenvolvimento do projeto: o nome, os endereços e como
+     * subir.
+     */
+    private function dockerSummary(Choice $choice): void
+    {
+        $name = (string) $choice->name;
+        $ports = DevEnvironment::ports((int) $choice->slot);
+
+        $this->out->line($this->t->get('done.docker', [
+            'name' => $name,
+            'slot' => (string) $choice->slot,
+        ]));
+        $this->out->line($this->t->get('done.site', ['url' => DevEnvironment::url($name, $ports['site'])]));
+        $this->out->line($this->t->get('done.mail', ['url' => DevEnvironment::url($name, $ports['mail'])]));
+        $this->out->line($this->t->get($choice->exposeDatabase ? 'done.database_exposed' : 'done.database_internal', [
+            'port' => (string) $ports['database'],
+        ]));
+        $this->out->line();
+        $this->out->line($this->t->get('done.next'));
+
+        if (! $this->inDocker) {
+            $this->out->command('cd '.$this->directory);
+        }
+
+        $this->out->command('docker compose up -d');
+        $this->out->line($this->t->get('done.open', ['url' => DevEnvironment::url($name, $ports['site'])]));
+    }
+
+    /**
+     * As variáveis do Docker de desenvolvimento para o instalador do starter.
+     *
+     * @return array<string, string>
+     */
+    private function devEnvironment(Choice $choice): array
+    {
+        if ($choice->name === null || $choice->slot === null) {
+            return [];
+        }
+
+        return [
+            'TWS_KIT_NAME' => $choice->name,
+            'TWS_KIT_SLOT' => (string) $choice->slot,
+            'TWS_KIT_EXPOSE_DB' => $choice->exposeDatabase ? '1' : '0',
+        ];
+    }
+
+    /**
+     * O texto — no container do instalador, a versão dele quando existe
+     * (docker.<chave>: "esta pasta" e os comandos do Docker no lugar de
+     * `cd` e `composer`).
+     *
+     * @param  array<string, string>  $replace
+     */
+    private function text(string $key, array $replace = []): string
+    {
+        if ($this->inDocker && $this->t->has("docker.{$key}")) {
+            return $this->t->get("docker.{$key}", $replace);
+        }
+
+        return $this->t->get($key, $replace);
     }
 
     /**

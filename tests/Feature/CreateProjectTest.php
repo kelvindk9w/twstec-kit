@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Twstec\Kit\Setup\Choice;
 use Twstec\Kit\Setup\CreateProject;
 use Twstec\Kit\Setup\Output;
+use Twstec\Kit\Setup\Tests\Fixtures\FakeHost;
 use Twstec\Kit\Setup\Tests\Fixtures\FakeRunner;
 
 // =============================================================================
@@ -17,6 +18,7 @@ use Twstec\Kit\Setup\Tests\Fixtures\FakeRunner;
 beforeEach(function (): void {
     $this->project = temporaryDirectory();
     $this->runner = new FakeRunner;
+    $this->host = new FakeHost;
     $this->stream = fopen('php://memory', 'w+');
 
     $kit = json_decode((string) file_get_contents(dirname(__DIR__, 2).'/composer.json'), true);
@@ -35,8 +37,12 @@ beforeEach(function (): void {
     mkdir($this->project.'/vendor');
     file_put_contents($this->project.'/vendor/autoload.php', "<?php\n");
 
-    $this->create = function (array $env = [], ?Closure $menu = null, string $locale = 'en'): int {
-        return (new CreateProject($this->project, translator($locale), $this->runner, new Output($this->stream, false), $env, $menu))->run();
+    // A pasta, como a pessoa a vê (a pasta temporária tem nome aleatório):
+    // a base do nome sugerido do projeto.
+    // O sistema (Linux; 'Windows' simula o PHP do Windows) e o comando de quem
+    // chamou (as opções do create-project).
+    $this->create = function (array $env = [], ?Closure $menu = null, string $locale = 'en', string $os = 'Linux', array $caller = []): int {
+        return (new CreateProject($this->project, translator($locale), $this->runner, new Output($this->stream, false), ['TWS_KIT_FOLDER' => 'meu-app', ...$env], $this->host, $menu, $os, $caller))->run();
     };
 
     $this->output = function (): string {
@@ -99,8 +105,18 @@ it('React sem uploads pelo ambiente: o starter React, sem o pacote desmarcado, e
 
     $installer = array_values(array_filter($this->runner->calls, fn (array $call): bool => ($call[1][1] ?? '') === 'post-create-project-cmd'))[0];
 
-    expect($installer[2])->toBe(['TWS_KIT_WITH' => 'accounts,admin', 'TWS_KIT_WITHOUT' => 'uploads', 'APP_LOCALE' => 'en'])
-        ->and(($this->output)())->toContain('Choice (no questions): React');
+    expect($installer[2])->toBe([
+        'TWS_KIT_WITH' => 'accounts,admin',
+        'TWS_KIT_WITHOUT' => 'uploads',
+        'APP_LOCALE' => 'en',
+        'TWS_KIT_FROM_KIT' => '1',
+        // O Docker de desenvolvimento: o nome da pasta e o primeiro número
+        // livre, sem o banco publicado.
+        'TWS_KIT_NAME' => 'meu-app',
+        'TWS_KIT_SLOT' => '0',
+        'TWS_KIT_EXPOSE_DB' => '0',
+    ])
+        ->and(($this->output)())->toContain('Choice (no questions): project meu-app, number 0; React');
 });
 
 it('só a base: nenhum módulo opcional no composer.json', function (): void {
@@ -266,3 +282,140 @@ it('a pasta do instalador que não sai (arquivo preso): o projeto fica pronto, c
         chmod($setup, 0755);
     }
 })->skip(function_exists('posix_getuid') && posix_getuid() === 0, 'como root, a permissão não impede apagar');
+
+// --- o Docker de desenvolvimento do projeto ----------------------------------
+
+it('número (TWS_KIT_SLOT) com porta ocupada: recusado ANTES de baixar qualquer coisa', function (): void {
+    $this->host->withProject('loja-da-maria', 0);
+
+    expect(($this->create)(['TWS_KIT_SLOT' => '0']))->toBe(1)
+        ->and($this->runner->calls)->toBe([])
+        ->and(($this->output)())->toContain('number 0 is in use — loja-da-maria')->toContain('Nothing was installed');
+});
+
+it('nome (TWS_KIT_NAME) de um projeto Docker que já existe: recusado ANTES de baixar qualquer coisa', function (): void {
+    $this->host->withProject('loja', 3);
+
+    expect(($this->create)(['TWS_KIT_NAME' => 'loja']))->toBe(1)
+        ->and($this->runner->calls)->toBe([])
+        ->and(($this->output)())->toContain('there is already a Docker project called loja')->toContain('suggestion: loja-2');
+});
+
+it('sem variável, com outro projeto no 0: o nome da pasta e o número 1 vão para o instalador', function (): void {
+    $this->host->withProject('outro', 0);
+
+    ($this->create)(['TWS_KIT_EXPOSE_DB' => '1']);
+
+    $installer = array_values(array_filter($this->runner->calls, fn (array $call): bool => ($call[1][1] ?? '') === 'post-create-project-cmd'))[0];
+
+    expect($installer[2])->toMatchArray(['TWS_KIT_NAME' => 'meu-app', 'TWS_KIT_SLOT' => '1', 'TWS_KIT_EXPOSE_DB' => '1'])
+        ->and(($this->output)())->toContain('Choice (no questions): project meu-app, number 1;');
+});
+
+it('starter com o Docker de desenvolvimento (compose.yaml): o resumo dá o endereço, os e-mails e o docker compose up -d — sem conferir banco da máquina', function (): void {
+    $this->runner->withCompose = true;
+
+    expect(($this->create)(['TWS_KIT_SLOT' => '4']))->toBe(0);
+
+    expect(($this->output)())->toContain('The project database runs in Docker')
+        ->toContain('Development Docker: project meu-app, number 4')
+        ->toContain('Site: http://meu-app.localhost:8084')
+        ->toContain('Sent e-mails (Mailpit): http://meu-app.localhost:8024')
+        ->toContain('COMPOSE_PROFILES=db-port')
+        ->toContain("    cd {$this->project}\n    docker compose up -d\n")
+        ->not->toContain('composer dev');
+
+    expect(array_filter($this->runner->calls, fn (array $call): bool => $call[0] === 'php'))->toBe([]);
+});
+
+it('no container do instalador: fala "desta pasta" e dos comandos do Docker (sem cd)', function (): void {
+    $this->runner->withCompose = true;
+
+    expect(($this->create)(['TWS_KIT_IN_DOCKER' => '1']))->toBe(0);
+
+    expect(($this->output)())->toContain('creating the project in this folder')
+        ->toContain('Project ready in this folder')
+        ->toContain("Next steps:\n    docker compose up -d\n")
+        ->not->toContain('    cd ');
+});
+
+it('no container, falha depois de montar o projeto: recomeçar do ZIP (sem comandos de composer na máquina)', function (): void {
+    $this->runner->failing['update'] = 1;
+
+    expect(($this->create)(['TWS_KIT_IN_DOCKER' => '1']))->toBe(1);
+
+    expect(($this->output)())->toContain('The project in this folder is incomplete')
+        ->toContain('Download the twstec-kit ZIP again, into a new folder')
+        ->not->toContain('    composer update');
+});
+
+it('no container, desistir no menu: nada instalado, e o comando para rodar de novo', function (): void {
+    expect(($this->create)(['TWS_KIT_IN_DOCKER' => '1'], fn (): ?Choice => null))->toBe(1)
+        ->and(($this->output)())->toContain('Run `docker compose run --rm instalar` again whenever you want.');
+});
+
+// --- extensões do PHP (ver também PlatformTest) ------------------------------
+
+it('Windows: TODAS as chamadas ao Composer ignoram só ext-pcntl e ext-posix — e o resumo avisa do Horizon', function (): void {
+    expect(($this->create)([], null, 'en', 'Windows'))->toBe(0);
+
+    foreach (array_filter($this->runner->calls, fn (array $call): bool => $call[0] === 'composer') as $call) {
+        expect($call[2]['COMPOSER_IGNORE_PLATFORM_REQ'] ?? null)->toBe('ext-pcntl,ext-posix', implode(' ', $call[1]));
+    }
+
+    expect(($this->output)())->toContain('Windows: Horizon (the queue dashboard) needs the pcntl and posix extensions')
+        ->toContain('php artisan queue:work')
+        ->toContain('docker compose run --rm instalar');
+});
+
+it('fora do Windows, nada é ignorado sem pedido; o que foi pedido (variável ou opção do create-project) chega a todas', function (): void {
+    ($this->create)();
+
+    foreach (array_filter($this->runner->calls, fn (array $call): bool => $call[0] === 'composer') as $call) {
+        expect($call[2])->not->toHaveKey('COMPOSER_IGNORE_PLATFORM_REQ')->not->toHaveKey('COMPOSER_IGNORE_PLATFORM_REQS');
+    }
+
+    expect(($this->output)())->not->toContain('Horizon');
+
+    $this->runner->calls = [];
+    ($this->writeKit)();
+    ($this->create)(['COMPOSER_IGNORE_PLATFORM_REQ' => 'ext-intl'], null, 'en', 'Linux', ['composer', 'create-project', 'twstec/kit', 'x', '--ignore-platform-req=ext-zip']);
+
+    foreach (array_filter($this->runner->calls, fn (array $call): bool => $call[0] === 'composer') as $call) {
+        expect($call[2]['COMPOSER_IGNORE_PLATFORM_REQ'] ?? null)->toBe('ext-intl,ext-zip');
+    }
+});
+
+it('extensão que falta no composer update: a lista, as duas saídas (instalar ou Docker) e como terminar', function (): void {
+    $this->runner->failing['update'] = 2;
+    $this->runner->failingOutput['update'] = MISSING_EXTENSIONS_OUTPUT;
+
+    expect(($this->create)())->toBe(1)
+        ->and($this->runner->captured)->toBe(['update']);
+
+    expect(($this->output)())->toContain('PHP extensions missing on this machine: bcmath, gd. There are two ways out:')
+        ->toContain('extension=bcmath, extension=gd')
+        ->toContain('sudo apt install php8.4-bcmath php8.4-gd')
+        ->toContain('Or use the Docker-only way')
+        ->toContain('docker compose run --rm instalar')
+        ->toContain("With the extensions installed, to finish without starting over:\n    cd {$this->project}\n    composer update\n    composer run-script post-create-project-cmd\n");
+});
+
+it('no Windows, a mesma falha: os comandos de terminar começam pelo que foi ignorado', function (): void {
+    $this->runner->failing['update'] = 2;
+    $this->runner->failingOutput['update'] = MISSING_EXTENSIONS_OUTPUT;
+
+    ($this->create)([], null, 'en', 'Windows');
+
+    expect(($this->output)())->toContain("    cd {$this->project}\n    \$env:COMPOSER_IGNORE_PLATFORM_REQ = \"ext-pcntl,ext-posix\"\n    composer update\n");
+});
+
+it('falha do composer update sem ser extensão: a mensagem de sempre, sem a lista', function (): void {
+    $this->runner->failing['update'] = 1;
+    $this->runner->failingOutput['update'] = 'Could not find package twstec/kit-foundation';
+
+    ($this->create)();
+
+    expect(($this->output)())->not->toContain('PHP extensions missing')
+        ->toContain('To finish without starting over, after fixing the cause:');
+});
