@@ -127,32 +127,58 @@ final class CreateProject
         return $folder !== '' ? $folder : basename($directory);
     }
 
-    public function run(): int
+    /**
+     * SÓ A ESCOLHA (o menu, ou a do ambiente, conferida), gravada em $file
+     * como as variáveis de escolha (uma `NOME=valor` por linha) — nada é
+     * baixado nem muda no projeto. O instalador em container roda este passo
+     * com acesso ao Docker (o menu confere os projetos e as portas da
+     * máquina) e o resto — Composer, instalador do starter, npm, código de
+     * terceiros — sem ele, com a escolha pelo ambiente (run()).
+     */
+    public function chooseInto(string $file): int
     {
-        $kit = $this->readJson($this->directory.'/composer.json');
-        $config = $kit->extra->{'twstec-kit'} ?? null;
+        $config = $this->kitConfig();
 
-        if (! $config instanceof stdClass || ! is_string($config->constraint ?? null) || ! ($config->starters ?? null) instanceof stdClass) {
-            $this->out->error($this->t->get('errors.kit_config'));
-
+        if ($config === null) {
             return 1;
         }
 
-        /** @var array<string, string> $starters */
-        $starters = array_map('strval', (array) $config->starters);
-        $defaultStack = (string) ($config->{'default-starter'} ?? array_key_first($starters));
-        $constraint = $config->constraint;
+        [$starters, $defaultStack] = $config;
 
         $this->out->line($this->text('intro', ['dir' => $this->directory]));
 
-        // A identidade do projeto (TWS_KIT_VENDOR/TWS_KIT_LICENSE) vale nos
-        // dois jeitos (menu e ambiente): conferida antes de qualquer coisa.
-        $identity = Choice::identityError($this->env, $this->t);
+        if (! $this->identityAccepted()) {
+            return 1;
+        }
 
-        if ($identity !== null) {
-            $this->out->error($identity);
-            $this->out->line($this->text('errors.nothing_installed', ['dir' => $this->directory]));
+        $choice = $this->choose($starters, $defaultStack, announce: false);
 
+        if ($choice === null) {
+            return 1;
+        }
+
+        $lines = '';
+
+        foreach ($choice->toEnvironment() as $name => $value) {
+            $lines .= "{$name}={$value}\n";
+        }
+
+        return file_put_contents($file, $lines) === false ? 1 : 0;
+    }
+
+    public function run(): int
+    {
+        $config = $this->kitConfig();
+
+        if ($config === null) {
+            return 1;
+        }
+
+        [$starters, $defaultStack, $constraint, $kit] = $config;
+
+        $this->out->line($this->text('intro', ['dir' => $this->directory]));
+
+        if (! $this->identityAccepted()) {
             return 1;
         }
 
@@ -199,9 +225,52 @@ final class CreateProject
     }
 
     /**
-     * @param  array<string, string>  $starters
+     * A configuração extra.twstec-kit do composer.json deste pacote: os
+     * starters, o padrão, a restrição de versão e o próprio composer.json —
+     * ou null (com o erro na tela).
+     *
+     * @return array{0: array<string, string>, 1: string, 2: string, 3: stdClass}|null
      */
-    private function choose(array $starters, string $defaultStack): ?Choice
+    private function kitConfig(): ?array
+    {
+        $kit = $this->readJson($this->directory.'/composer.json');
+        $config = $kit->extra->{'twstec-kit'} ?? null;
+
+        if (! $config instanceof stdClass || ! is_string($config->constraint ?? null) || ! ($config->starters ?? null) instanceof stdClass) {
+            $this->out->error($this->t->get('errors.kit_config'));
+
+            return null;
+        }
+
+        /** @var array<string, string> $starters */
+        $starters = array_map('strval', (array) $config->starters);
+
+        return [$starters, (string) ($config->{'default-starter'} ?? array_key_first($starters)), $config->constraint, $kit];
+    }
+
+    /**
+     * A identidade do projeto (TWS_KIT_VENDOR/TWS_KIT_LICENSE) vale nos dois
+     * jeitos (menu e ambiente): conferida antes de qualquer coisa.
+     */
+    private function identityAccepted(): bool
+    {
+        $identity = Choice::identityError($this->env, $this->t);
+
+        if ($identity === null) {
+            return true;
+        }
+
+        $this->out->error($identity);
+        $this->out->line($this->text('errors.nothing_installed', ['dir' => $this->directory]));
+
+        return false;
+    }
+
+    /**
+     * @param  array<string, string>  $starters
+     * @param  bool  $announce  mostrar a escolha lida do ambiente
+     */
+    private function choose(array $starters, string $defaultStack, bool $announce = true): ?Choice
     {
         if ($this->menu !== null) {
             $choice = ($this->menu)($starters, $defaultStack);
@@ -220,6 +289,10 @@ final class CreateProject
             $this->out->line($this->text('errors.nothing_installed', ['dir' => $this->directory]));
 
             return null;
+        }
+
+        if (! $announce) {
+            return $choice;
         }
 
         $this->out->line($this->t->get('plan.from_environment', [
@@ -380,11 +453,11 @@ final class CreateProject
             }
 
             $this->out->line($this->t->get($missing === [] ? 'failures.finish' : 'failures.finish_after_extensions'));
-            $this->out->command('cd '.$this->directory);
+            $this->out->command('cd '.$this->shellArgument($this->directory));
 
             // O que foi ignorado aqui vale para os comandos de terminar.
             foreach ($this->platform as $name => $value) {
-                $this->out->command($this->windows ? "\$env:{$name} = \"{$value}\"" : "export {$name}={$value}");
+                $this->out->command($this->windows ? "\$env:{$name} = ".$this->shellArgument($value, quoted: true) : "export {$name}=".$this->shellArgument($value));
             }
 
             foreach (array_slice($steps, $index) as [, $remaining]) {
@@ -451,7 +524,7 @@ final class CreateProject
             $this->dockerSummary($choice);
         } else {
             $this->out->line($this->t->get('done.next'));
-            $this->out->command('cd '.$this->directory);
+            $this->out->command('cd '.$this->shellArgument($this->directory));
             $this->out->command('npm install && npm run build');
             $this->out->command('composer dev');
         }
@@ -490,7 +563,7 @@ final class CreateProject
         $this->out->line($this->t->get('done.next'));
 
         if (! $this->inDocker) {
-            $this->out->command('cd '.$this->directory);
+            $this->out->command('cd '.$this->shellArgument($this->directory));
         }
 
         $this->out->command('docker compose up -d');
@@ -513,6 +586,29 @@ final class CreateProject
             'TWS_KIT_SLOT' => (string) $choice->slot,
             'TWS_KIT_EXPOSE_DB' => $choice->exposeDatabase ? '1' : '0',
         ];
+    }
+
+    /**
+     * Um argumento para o comando mostrado na tela, pronto para copiar e
+     * colar: como está, se só tem caracteres sem significado para o shell;
+     * senão entre aspas simples — no Windows as do PowerShell (aspa dobrada),
+     * fora dele as do sh (aspa vira '\''). $quoted: sempre entre aspas (o
+     * valor de `$env:NOME = …` no PowerShell) — duplas, quando nada nele
+     * expande.
+     */
+    private function shellArgument(string $value, bool $quoted = false): string
+    {
+        $plain = $value !== '' && preg_match('~^[A-Za-z0-9_./:,=+@%-]+$~', $value) === 1;
+
+        if ($plain && ! $quoted) {
+            return $value;
+        }
+
+        if ($this->windows) {
+            return $plain ? "\"{$value}\"" : "'".str_replace("'", "''", $value)."'";
+        }
+
+        return "'".str_replace("'", "'\\''", $value)."'";
     }
 
     /**
