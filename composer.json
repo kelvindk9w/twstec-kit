@@ -42,7 +42,7 @@
     },
     "extra": {
         "twstec-kit": {
-            "constraint": "^2.0@beta",
+            "constraint": "^2.0",
             "starters": {
                 "livewire": "twstec/starter-livewire",
                 "react": "twstec/starter-react"
